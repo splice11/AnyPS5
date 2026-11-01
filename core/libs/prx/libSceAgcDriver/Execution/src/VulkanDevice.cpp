@@ -1222,7 +1222,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
                 throw std::runtime_error(std::string("Vulkan presentation: required instance extension missing: ") + name);
             }
         }
-        if (std::any_of(available.begin(), available.end(), [](const auto& item) { return std::strcmp(item.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) == 0; })) {
+        if (!std::getenv("APS5_LOCAL_NO_COLORSPACE") && std::any_of(available.begin(), available.end(), [](const auto& item) { return std::strcmp(item.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) == 0; })) {
             instanceExtensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
             state->swapchainColorSpaces = true;
         }

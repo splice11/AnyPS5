@@ -248,6 +248,13 @@ std::uint32_t EmitBuiltinU32(SpirvEmitterState& state, StageInputKind kind, std:
         const auto bits = state.module.AllocateId();
         state.module.AddFunction(spv::OpLoad, TypeI32(state), value, variable);
         state.module.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
+        if (kind == StageInputKind::Layer && state.program.Resources().stage == IrShaderStage::Pixel) {
+            const auto pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, ConstantU32(state, 0u), ConstantU32(state, FragmentLayerBaseDword));
+            const auto base = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, TypeU32(state), base, pointer);
+            return EmitBinaryU32(state, spv::OpIAdd, bits, base);
+        }
         return kind == StageInputKind::SampleId ? GuestSampleIndex(state, bits) : bits;
     }
     if (kind == StageInputKind::SampleMask) {
@@ -1451,7 +1458,28 @@ void EmitMeshEntryPoint(SpirvEmitterState& state) {
                 const auto layer = MeshLoad(state, output.meshDataVariable, spv::StorageClassWorkgroup, TypeU32(state), vertex.at(state.inputInfo.vertex->mesh.provokingVertex));
                 const auto pointer = state.module.AllocateId();
                 state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, TypeU32(state)), pointer, output.variableId, index, ConstantU32(state, 0u));
-                state.module.AddFunction(spv::OpStore, pointer, layer);
+                const auto wordPointer = state.module.AllocateId();
+                state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), wordPointer, state.pushConstantVariable, ConstantU32(state, 0u), ConstantU32(state, MeshDrawPushOffsetBytes / 4u + 3u));
+                const auto word = state.module.AllocateId();
+                state.module.AddFunction(spv::OpLoad, TypeU32(state), word, wordPointer);
+                const auto window = state.module.AllocateId();
+                state.module.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), window, word, ConstantU32(state, MeshLayerWindowShift), ConstantU32(state, 7u));
+                const auto windowed = state.module.AllocateId();
+                state.module.AddFunction(spv::OpINotEqual, TypeBool(state), windowed, window, ConstantU32(state, 0u));
+                const auto first = EmitBinaryU32(state, spv::OpIMul, EmitBinaryU32(state, spv::OpISub, window, ConstantU32(state, 1u)), ConstantU32(state, MeshLayerWindowLayers));
+                const auto relative = EmitBinaryU32(state, spv::OpISub, layer, first);
+                const auto beyond = state.module.AllocateId();
+                state.module.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), beyond, relative, ConstantU32(state, MeshLayerWindowLayers));
+                const auto outside = state.module.AllocateId();
+                state.module.AddFunction(spv::OpLogicalAnd, TypeBool(state), outside, windowed, beyond);
+                const auto dropped = state.module.AllocateId();
+                state.module.AddFunction(spv::OpLogicalOr, TypeBool(state), dropped, culled, outside);
+                state.module.AddFunction(spv::OpStore, MeshElement(state, state.meshCull, spv::StorageClassOutput, TypeBool(state), index), dropped);
+                const auto inWindow = state.module.AllocateId();
+                state.module.AddFunction(spv::OpSelect, TypeU32(state), inWindow, beyond, ConstantU32(state, 0u), relative);
+                const auto written = state.module.AllocateId();
+                state.module.AddFunction(spv::OpSelect, TypeU32(state), written, windowed, inWindow, layer);
+                state.module.AddFunction(spv::OpStore, pointer, written);
             }
             if (emulating) {
                 const auto corners = state.module.Type(spv::OpTypeArray, TypeF32Vector(state, 4u), ConstantU32(state, 3u));

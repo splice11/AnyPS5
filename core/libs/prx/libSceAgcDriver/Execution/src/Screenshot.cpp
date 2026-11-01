@@ -55,6 +55,10 @@ void AgcDriver::Screenshot::Request() {
 }
 
 bool AgcDriver::Screenshot::Take() {
+    if (const char* trigger = std::getenv("APS5_LOCAL_SCREENSHOT_TRIGGER")) {
+        std::error_code error;
+        if (std::filesystem::remove(trigger, error)) return true;
+    }
     return requested.exchange(false);
 }
 

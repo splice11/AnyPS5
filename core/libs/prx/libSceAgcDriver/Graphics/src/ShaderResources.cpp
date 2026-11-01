@@ -750,7 +750,8 @@ PendingLookup pendingLookupSource(const Context& context, const GuestTextureReso
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D) {
-    const auto resource = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
+    auto resource = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
+    if (resource.dimension == TextureDimension::k3D) resource.dccAddress = 0;
     if (resource.baseAddress != requested.baseAddress) guestBytes = 0;
     if (resource.dimension == TextureDimension::k2DMsaa) {
         Require(!depthCompare, "native multisampled depth comparison sampling is not implemented");
@@ -835,6 +836,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const bool depthCopy = lookup.depthCopy;
     const bool srgbExpand = lookup.srgbExpand;
     auto source = std::move(lookup.source);
+    const bool localLog3d = resource.dimension == TextureDimension::k3D && resource.width == 32u && resource.height == 32u;
+    static std::atomic<int> localLog3dCount{0};
+    if (localLog3d && localLog3dCount.fetch_add(1) < 6) std::fprintf(stderr, "[local-3d-lookup] 0x%llx pending source=%s guestBytes=%llu eligible=%d\n", static_cast<unsigned long long>(resource.baseAddress), source ? "found" : "none", static_cast<unsigned long long>(guestBytes), SampledFromStorageEligible(context, resource, guestBytes) ? 1 : 0);
     const bool blockCopy = lookup.blockCopy;
     std::optional<DccKeys> keys;
     bool clearThroughKeys = false;
@@ -889,6 +893,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // so a write the game made since the last walk is invisible until a collect stamps its page. The
     // walk is memoized per packet, so a texture viewed from a storage image repeats it for free.
     auto generation = GuestMemory::CollectWrites(address, bytes);
+    if (localLog3d && localLog3dCount.load() < 12) { localLog3dCount.fetch_add(1); std::fprintf(stderr, "[local-3d-lookup] 0x%llx before snapshot decision source=%s keys=%s\n", static_cast<unsigned long long>(resource.baseAddress), source ? "set" : "null", keys.has_value() ? DccKeysName(*keys) : "unscanned"); }
     if (source != nullptr && !GuestMemory::UnchangedSince(address, bytes, source->GenerationFor(address, bytes))) {
         // The CPU wrote the memory while results were pending: Refresh merges them the usual way.
         refreshForView(*source, resource);
@@ -903,6 +908,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         return IsDccClear(observedKeys) || observedKeys == DccKeys::ClearSingle;
     }();
     bool stagedFlushed = false;
+    if (resource.dimension == TextureDimension::k3D && source != nullptr && std::getenv("APS5_LOCAL_NO_3D_FLUSH") == nullptr) source.reset();
     const bool flushAsked = (source == nullptr || stagedClear) && !clearThroughKeys;
     if (flushAsked && StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture")) {
         if (profile) LookupOutcomes::Add(LookupOutcomes::PendingFlush, flushStart);

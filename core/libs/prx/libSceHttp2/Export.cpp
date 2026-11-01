@@ -1,5 +1,6 @@
 #include "prx/libSceHttp2/include/Http2.hpp"
 #include <cstdint>
+#include <cstdio>
 #include <cstddef>
 #include <cstring>
 #include "SceTypes.hpp"
@@ -29,6 +30,19 @@ static constexpr int ERROR_NOT_FOUND = static_cast<int>(0x817B1025);
 static constexpr int ERROR_INVALID_VALUE = static_cast<int>(0x817B11FE);
 static constexpr int ERROR_TIMEOUT = static_cast<int>(0x817B1079);
 static constexpr int ERROR_HTTP_INVALID_VALUE = static_cast<int>(0x804311FE);
+static constexpr int ERROR_RESPONSE_UNAVAILABLE = static_cast<int>(0x817B1065);
+
+static int LocalNetworkFailure(const std::exception_ptr& failure) {
+    std::string message = "unknown";
+    try { std::rethrow_exception(failure); } catch (const std::exception& e) { message = e.what(); } catch (...) {}
+    std::fprintf(stderr, "[http2-local] transport failure returned as an error: %s\n", message.c_str());
+    return message.find("timed out") != std::string::npos ? ERROR_TIMEOUT : ERROR_RESPONSE_UNAVAILABLE;
+}
+
+template <typename F>
+static int LocalSoft(F&& call) {
+    try { return call(); } catch (...) { return LocalNetworkFailure(std::current_exception()); }
+}
 
 enum class Http2Kind : std::uint8_t { Context, Template, Request, CookieBox };
 
@@ -270,7 +284,7 @@ int APS5_VABI sceHttp2Init(int libnet_mem_id, int libssl_ctx_id, size_t pool_siz
 
 int APS5_VABI sceHttp2ReadData(int req_id, void* data, size_t size) {
     const auto request = Transport(req_id, false);
-    return request ? request->Read(data, size) : ERROR_INVALID_ID;
+    return request ? LocalSoft([&] { return request->Read(data, size); }) : ERROR_INVALID_ID;
 }
 
 int APS5_VABI sceHttp2ReadDataAsync(int req_id, void* data, size_t size, void* kqueue_option, void* option) {
@@ -287,7 +301,7 @@ int APS5_VABI sceHttp2ReadDataAsync(int req_id, void* data, size_t size, void* k
         try {
             result = request->Read(data, size);
         } catch (...) {
-            failure = std::current_exception();
+            result = LocalNetworkFailure(std::current_exception());
         }
         CompleteAsync(state, req_id, async ? &*async : nullptr, 1, result, std::move(failure));
     }).detach();
@@ -296,7 +310,7 @@ int APS5_VABI sceHttp2ReadDataAsync(int req_id, void* data, size_t size, void* k
 
 int APS5_VABI sceHttp2SendRequest(int req_id, const void* post_data, size_t size) {
     const auto request = Transport(req_id, true);
-    return request ? request->Send(post_data, size) : ERROR_INVALID_ID;
+    return request ? LocalSoft([&] { return request->Send(post_data, size); }) : ERROR_INVALID_ID;
 }
 
 int APS5_VABI sceHttp2SendRequestAsync(int req_id, const void* post_data, size_t size, Http2AsyncOption* kqueue_option, void* option) {
@@ -315,7 +329,7 @@ int APS5_VABI sceHttp2SendRequestAsync(int req_id, const void* post_data, size_t
         try {
             result = request->Send(body.empty() ? nullptr : body.data(), body.size());
         } catch (...) {
-            failure = std::current_exception();
+            result = LocalNetworkFailure(std::current_exception());
         }
         CompleteAsync(state, req_id, async ? &*async : nullptr, 0, result, std::move(failure));
     }).detach();
@@ -428,7 +442,6 @@ int APS5_VABI sceHttp2WaitAsync(int req_id, Http2AsyncResult* result, uint32_t* 
         if (!handle) return ERROR_INVALID_ID;
         state = handle->async;
     }
-    if (timeout && *timeout == 0) NotImplemented_nid_no_patch(__func__);
     std::unique_lock lock(state->mutex);
     const auto available = [&] { return state->retired || !state->pending.empty(); };
     if (timeout) {

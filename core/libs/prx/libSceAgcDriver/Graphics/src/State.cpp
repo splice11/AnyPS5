@@ -1,3 +1,6 @@
+#include <tuple>
+#include <mutex>
+#include <set>
 #include <cstdio>
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
@@ -2183,6 +2186,15 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot, bool allo
         Require(slice < viewDepth && lastSlice >= slice, "the color view slices are outside the 3D surface");
         color.depthSlice = slice;
         color.layers = std::min(lastSlice + 1u, viewDepth) - slice;
+        {
+            static std::mutex localLogMutex;
+            static std::set<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t>> localLogged;
+            const auto vsOut = read(cx, 0x207);
+            std::lock_guard localLock(localLogMutex);
+            if (localLogged.emplace(static_cast<std::uint64_t>(read(cx, 0x318 + slot * 15u)), slice, lastSlice, vsOut).second)
+                std::fprintf(stderr, "[local-3d-target] slot=%u base=0x%x depth=%u slices=%u..%u viewMip=%u layers=%u attrib3=0x%08x PA_CL_VS_OUT_CNTL=0x%08x\n",
+                             slot, read(cx, 0x318 + slot * 15u), color.depth, slice, lastSlice, viewMip, color.layers, attrib3, vsOut);
+        }
     } else if ((attrib3 & 0x1fffu) != 0) {
         Require(lastSlice <= (attrib3 & 0x1fffu), "the color view slice is beyond the array surface");
         color.arrayLastSlice = attrib3 & 0x1fffu;

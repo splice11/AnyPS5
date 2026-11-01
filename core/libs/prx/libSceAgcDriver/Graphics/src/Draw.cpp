@@ -2311,10 +2311,18 @@ void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const
     }
     const auto firstVertex = draw.indirect ? draw.indirect->vertexConstant : draw.firstVertex;
     const auto firstInstance = draw.indirect ? draw.indirect->instanceConstant : draw.firstInstance;
-    std::array<std::uint32_t, ShaderRecompiler::MeshDrawPushBytes / 4> words{draw.indexCount, firstVertex, firstInstance, (draw.indexed ? draw.indexSize | (restartTable ? ShaderRecompiler::MeshIndexRestartTable : 0u) : 0u) | meshLayerStride << ShaderRecompiler::MeshLayerStrideShift, static_cast<std::uint32_t>(meshArguments), static_cast<std::uint32_t>(meshArguments >> 32u)};
+    std::array<std::uint32_t, ShaderRecompiler::MeshDrawPushBytes / 4> words{draw.indexCount, firstVertex, firstInstance, (draw.indexed ? draw.indexSize | (restartTable ? ShaderRecompiler::MeshIndexRestartTable : 0u) : 0u) | meshLayerStride << ShaderRecompiler::MeshLayerStrideShift | state.meshLayerWindow << ShaderRecompiler::MeshLayerWindowShift, static_cast<std::uint32_t>(meshArguments), static_cast<std::uint32_t>(meshArguments >> 32u)};
     if (state.tessellationCapture != nullptr) words = {static_cast<std::uint32_t>(capturedItems), static_cast<std::uint32_t>(capturedItems >> 32u), 0u, 0u, static_cast<std::uint32_t>(meshArguments), static_cast<std::uint32_t>(meshArguments >> 32u)};
     static_assert(ShaderRecompiler::MeshDrawPushOffsetBytes + ShaderRecompiler::MeshDrawPushBytes == PipelinePushSlotBytes);
     std::memcpy(block.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, words.data(), sizeof(words));
+    if (state.meshLayerWindow != 0) {
+        const auto baseOffset = (ShaderRecompiler::FragmentLayerBaseDword * 4u) % PipelinePushSlotBytes;
+        for (const auto& shader : shaders) {
+            Require(shader.stage != ShaderRecompiler::ShaderStage::Fragment || shader.program->pushConstants.empty() || shader.pushConstantOffset % PipelinePushSlotBytes + shader.program->pushConstants.size() <= baseOffset, "fragment push data overlaps the mesh layer window base");
+        }
+        const std::uint32_t firstLayer = (state.meshLayerWindow - 1u) * ShaderRecompiler::MeshLayerWindowLayers;
+        std::memcpy(block.data() + PipelinePushSlotBytes + baseOffset, &firstLayer, sizeof(firstLayer));
+    }
     pipeline.PushConstants(commands, stages | VK_SHADER_STAGE_MESH_BIT_EXT, block);
 }
 
@@ -3746,6 +3754,25 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (state.stages.tessellationGeometry) {
         drawTessellationGeometry(context, state, draw, shaders, snapshots, trace);
+        return;
+    }
+    if (state.stages.mesh && state.meshLayerWindow == 0 && state.renderLayers > ShaderRecompiler::MeshLayerWindowLayers && std::ranges::all_of(state.colors, [](const auto& color) { return color.volume; })) {
+        // Only maxMeshOutputLayers layers are addressable from a mesh shader (8 on RADV): each window draws
+        // through its own attachment view, its shader dropping the primitives of other windows.
+        const auto windows = (state.renderLayers - 1u) / ShaderRecompiler::MeshLayerWindowLayers + 1u;
+        Require(windows <= ShaderRecompiler::MeshLayerWindowLimit, "layered mesh draw has too many layers");
+        for (std::uint32_t window = 0; window < windows; ++window) {
+            auto part = state;
+            const auto first = window * ShaderRecompiler::MeshLayerWindowLayers;
+            part.meshLayerWindow = window + 1u;
+            part.renderLayers = std::min(ShaderRecompiler::MeshLayerWindowLayers, state.renderLayers - first);
+            for (auto& color : part.colors) {
+                color.depthSlice += first;
+                color.layers = part.renderLayers;
+            }
+            part.color = part.colors.front();
+            Draw(context, part, draw, shaders, snapshots, nullptr, trace);
+        }
         return;
     }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

@@ -1,3 +1,5 @@
+#include <mutex>
+#include <set>
 #include <cstdio>
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
@@ -282,6 +284,13 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> descri
             break;
     }
 
+    if (dimension == TextureDimension::k3D && width == 32u && height == 32u && depth == 31u) {
+        static std::mutex localLogMutex;
+        static std::set<std::uint64_t> localLogged;
+        std::lock_guard localLock(localLogMutex);
+        if (localLogged.insert(static_cast<std::uint64_t>(baseAddress)).second)
+            std::fprintf(stderr, "[local-3d-texture] base=0x%llx 32x32x32 tileModeRaw=%u format=%u mips=%u\n", static_cast<unsigned long long>(baseAddress), static_cast<unsigned>(tileModeRaw), static_cast<unsigned>(format), static_cast<unsigned>(maxMip + 1u));
+    }
     GuestTextureResource result{};
     result.baseAddress = baseAddress;
     result.pipeBankXor = pipeBankXor;

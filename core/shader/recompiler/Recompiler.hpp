@@ -419,6 +419,12 @@ inline constexpr std::uint32_t MeshArgumentBytes = 20;
 inline constexpr std::uint32_t MeshIndexRestartTable = 0x100;
 inline constexpr std::uint32_t MeshLayerStrideShift = 16;
 inline constexpr std::uint32_t MeshLayerStrideLimit = 0xffff;
+// A layered mesh draw beyond the guaranteed maxMeshOutputLayers runs once per window of layers:
+// bits 9-15 of the index word hold the window number + 1, and the fragment slot's last dword the first layer.
+inline constexpr std::uint32_t MeshLayerWindowShift = 9;
+inline constexpr std::uint32_t MeshLayerWindowLimit = 0x7f;
+inline constexpr std::uint32_t MeshLayerWindowLayers = 8;
+inline constexpr std::uint32_t FragmentLayerBaseDword = 31;
 inline constexpr std::uint32_t MeshRestartLengthDword = MeshArgumentBytes / 4;
 inline constexpr std::uint32_t MeshRestartTableDword = MeshRestartLengthDword + 1;
 inline constexpr std::uint32_t MeshCapturedCounterDword = MeshArgumentBytes / 4;

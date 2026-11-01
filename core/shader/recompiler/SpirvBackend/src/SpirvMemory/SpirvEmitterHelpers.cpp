@@ -149,7 +149,7 @@ std::uint32_t PushConstantArrayType(SpirvEmitterState& state) {
 
 std::uint32_t PushConstantBlockType(SpirvEmitterState& state) {
     return state.module.DecoratedType(spv::OpTypeStruct,
-        {{spv::OpMemberDecorate, {0u, spv::DecorationOffset, state.program.Metadata().bindings.PushSlotDword() * 4u}},
+        {{spv::OpMemberDecorate, {0u, spv::DecorationOffset, (state.program.Resources().stage == IrShaderStage::Pixel ? PushData::DwordCount : state.program.Metadata().bindings.PushSlotDword()) * 4u}},
          {spv::OpDecorate, {spv::DecorationBlock}}},
         PushConstantArrayType(state));
 }
@@ -468,7 +468,7 @@ void DefineOutputs(SpirvEmitterState& state) {
 void DefineDescriptors(SpirvEmitterState& state) {
     const IrBindingLayout& layout = state.program.Metadata().bindings;
     const IrShaderStage stage = state.program.Resources().stage;
-    if (layout.UsesPushData() || state.stencilReplay || stage == IrShaderStage::Mesh || stage == IrShaderStage::TessellationControl || (state.depthRangeRemap && (stage == IrShaderStage::Vertex || stage == IrShaderStage::TessellationEvaluation))) {
+    if (layout.UsesPushData() || state.stencilReplay || stage == IrShaderStage::Pixel || stage == IrShaderStage::Mesh || stage == IrShaderStage::TessellationControl || (state.depthRangeRemap && (stage == IrShaderStage::Vertex || stage == IrShaderStage::TessellationEvaluation))) {
         const auto type = PushConstantBlockType(state);
         state.pushConstantVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
         state.module.AddName(type, "BufferResource");

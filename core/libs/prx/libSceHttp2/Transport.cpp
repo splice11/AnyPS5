@@ -652,7 +652,6 @@ struct Request::State {
                 return;
             }
             Require(status >= 200 && status <= 599 && !(hasLength && chunked), "sceHttp2: invalid or ambiguous HTTP1 framing");
-            Require(!settings.auth || (status != 401 && status != 407), "sceHttp2: authentication is not implemented");
             remaining = contentLength;
             ready = true;
             ended = method == "HEAD" || status == 204 || status == 304 || (hasLength && remaining == 0);
@@ -794,7 +793,6 @@ struct Request::State {
             if (frame->hd.stream_id != state.stream) return;
             if (frame->hd.type == NGHTTP2_HEADERS && state.blockStatus >= 200) {
                 state.status = state.blockStatus;
-                Require(!state.settings.auth || (state.status != 401 && state.status != 407), "sceHttp2: authentication is not implemented");
                 state.ready = true;
             }
             if ((frame->hd.type == NGHTTP2_HEADERS || frame->hd.type == NGHTTP2_DATA) &&

@@ -563,7 +563,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                 }
             }
         } else if (variable.storage == spv::StorageClassPushConstant) {
-            Require(!push && (!shader.pushConstants.empty() || shader.readsDepthRemapPush || mesh || (control && !rectListControl) || (geometry && state.tessellationCapture)) && (type[0] & 0xffffu) == spv::OpTypeStruct, "invalid push constant interface");
+            Require(!push && (!shader.pushConstants.empty() || shader.readsDepthRemapPush || fragment || mesh || (control && !rectListControl) || (geometry && state.tessellationCapture)) && (type[0] & 0xffffu) == spv::OpTypeStruct, "invalid push constant interface");
             push = true;
             Require(type.size() == 3 && module.decorations[typeId].block, "push constant variable must be a Block struct with exactly one member");
             const auto offset = module.offsets.find({typeId, 0});
@@ -643,7 +643,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
         Require(shader.vertexAttributes.empty(), "vertex attribute metadata is invalid for this stage");
     }
     Require(descriptors.size() == shader.bindings.size(), "recompiler binding metadata contains undeclared resources");
-    Require(push == (!shader.pushConstants.empty() || shader.readsDepthRemapPush || mesh || (control && !rectListControl && !barycentricPatches) || (geometry && state.tessellationCapture)), "recompiler push constant metadata disagrees with SPIR-V");
+    Require(push == (!shader.pushConstants.empty() || shader.readsDepthRemapPush || fragment || mesh || (control && !rectListControl && !barycentricPatches) || (geometry && state.tessellationCapture)), "recompiler push constant metadata disagrees with SPIR-V");
     for (const auto id : module.interface) Require(module.variables.contains(id), "entry point interface contains an unknown variable");
     if (mesh) Require(module.primitiveIndices == state.stages.mesh->outputPrimitiveSize, "mesh shader does not export primitive indices");
     if (fragment) Require(module.primitiveInputs == 0 || !primitiveLocations.empty(), "per-primitive pixel inputs need the barycentric emulation layout");
