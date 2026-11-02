@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "SceTypes.hpp"
 #include <algorithm>
 #include <array>
@@ -37,6 +38,7 @@
 #endif
 #ifdef __linux__
 #include "prx/libc/include/specifics/linux/HostMapping.hpp"
+#include <dlfcn.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -70,6 +72,43 @@ struct Options {
     std::chrono::milliseconds drainTimeout{10000};
     bool release = true;
     bool synthesize = true;
+};
+
+// The replay has no swapchain, so RenderDoc cannot see frame ends. When it is loaded as a layer
+// (ENABLE_VULKAN_RENDERDOC_CAPTURE=1), APS5_REPLAY_RENDERDOC brackets the whole captured window as one capture.
+class RenderDocWindow {
+public:
+    RenderDocWindow() {
+#ifdef __linux__
+        if (std::getenv("APS5_REPLAY_RENDERDOC") == nullptr) return;
+        void* library = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD);
+        if (library == nullptr) throw std::runtime_error("frame replay: APS5_REPLAY_RENDERDOC is set but RenderDoc is not loaded");
+        using GetApi = int (*)(int, void**);
+        const auto getApi = reinterpret_cast<GetApi>(dlsym(library, "RENDERDOC_GetAPI"));
+        constexpr int Version112 = 10102;
+        if (getApi == nullptr || getApi(Version112, reinterpret_cast<void**>(&api)) != 1) throw std::runtime_error("frame replay: RenderDoc API 1.1.2 is unavailable");
+        call<void>(StartFrameCapture);
+        std::fprintf(stderr, "[frame-replay] RenderDoc capture started\n");
+#endif
+    }
+
+    ~RenderDocWindow() {
+        if (api == nullptr) return;
+        const auto ended = call<std::uint32_t>(EndFrameCapture);
+        std::fprintf(stderr, "[frame-replay] RenderDoc capture %s\n", ended != 0 ? "written" : "failed");
+    }
+
+private:
+    // Slots of RENDERDOC_API_1_1_2 (renderdoc_app.h).
+    static constexpr std::size_t StartFrameCapture = 19;
+    static constexpr std::size_t EndFrameCapture = 21;
+
+    template <typename TResult>
+    TResult call(std::size_t slot) {
+        return reinterpret_cast<TResult (*)(void*, void*)>(api[slot])(nullptr, nullptr);
+    }
+
+    void** api = nullptr;
 };
 
 class Frames {
@@ -292,6 +331,18 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
         }
         for (auto& future : pending) future.get();
     }
+#ifdef __linux__
+    // The title's direct memory was write-watched when it was mapped; restored ranges were not, so without this the
+    // driver treats them as unwatched heaps (full copies, no CPU-store tracking) instead of as the title had them.
+    std::uint64_t watched = 0;
+    for (std::size_t index = 0; index < reader.Chunks().size(); ++index) {
+        const auto& chunk = reader.Chunks()[index];
+        if (chunk.kind != FrameMemoryKind::Range || chunk.rangeKind != FrameRangeKind::Watched || owned[index] || skipped.Overlaps(chunk)) continue;
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes));
+        watched += chunk.bytes;
+    }
+    std::fprintf(stderr, "[frame-replay] write-watched %.1f MiB of restored ranges\n", static_cast<double>(watched) / (1024.0 * 1024.0));
+#endif
     return skipped;
 }
 
@@ -719,6 +770,7 @@ int run(const Options& options) {
     const FrameCaptureReader reader(options.directory);
     if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying the complete records\n");
     auto skipped = restoreMemory(reader);
+    if (const auto planes = AgcDriverLoadSavedDepth_nid_postfix((options.directory / "depth.bin").string().c_str()); planes != 0) std::fprintf(stderr, "[frame-replay] %zu saved depth planes\n", planes);
     const auto loaded = Clock::now();
     Replay replay{options, reader};
     replay.skipped = std::move(skipped);
@@ -730,8 +782,11 @@ int run(const Options& options) {
     for (auto call = calls.begin(); call != frameStart; ++call) replay.execute(*call);
     replay.recording = true;
     replay.startedAt = Clock::now();
-    if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
-    if (frameStart == calls.end()) AgcDriverWaitIdle_nid_postfix();
+    {
+        RenderDocWindow renderDoc;
+        if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
+        if (frameStart == calls.end()) AgcDriverWaitIdle_nid_postfix();
+    }
     replay.endedAt = Clock::now();
     if (const auto failure = replay.frames.Failure()) std::rethrow_exception(failure);
     FrameCheck check;

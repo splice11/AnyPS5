@@ -11,6 +11,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <set>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -68,6 +69,9 @@ private:
     void emitDelta();
     void emitShaderDelta(std::span<const Shader* const> shaders);
     void writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added = {});
+    void collectShaderPages(std::span<const Shader* const> shaders, std::set<std::uint64_t>& blocks, std::set<std::uint64_t>& hostPages);
+    std::vector<Range> uncoveredHostPages(const std::set<std::uint64_t>& hostPages) const;
+    void writeSavedDepth();
     bool triggered();
     void start();
     void finish();
@@ -108,6 +112,12 @@ private:
     std::uint64_t hostOnlySampleBytes = 0;
     std::uint64_t allocationsGeneration = 0;
     std::uint64_t lateRanges = 0;
+    std::uint64_t unsyncedDeltas = 0;
+    std::uint64_t prologueHostRanges = 0;
+    std::uint64_t savedDepthPlanes = 0;
+    FrameCallKind pendingKind = FrameCallKind::Submit;
+    std::set<const Shader*> prologueShaders;
+    std::vector<std::pair<Range, std::vector<std::byte>>> prologuePages;
     std::vector<std::string> warnings;
     std::chrono::steady_clock::time_point origin;
     std::chrono::steady_clock::time_point startedAt;

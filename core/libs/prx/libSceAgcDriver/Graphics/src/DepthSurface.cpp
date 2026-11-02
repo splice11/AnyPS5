@@ -14,6 +14,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
+#include <fstream>
+#include <cstring>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -265,6 +267,36 @@ std::optional<DepthPlaneOverwrite> decodeOverwrite(const StorageImageClear& clea
     overwrite.height = clear.height;
     return overwrite;
 }
+
+// A host-visible, coherent transfer buffer, kept mapped.
+struct HostStaging {
+    HostStaging(const Context& context, std::size_t bytes) : context(context) {
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.size = bytes;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        Check(context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &buffer), "vkCreateBuffer depth staging");
+        VkMemoryRequirements requirements{};
+        context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, buffer, &requirements);
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory depth staging");
+        Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory depth staging");
+        Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, memory, 0, VK_WHOLE_SIZE, 0, &mapped), "vkMapMemory depth staging");
+    }
+    ~HostStaging() {
+        if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
+        if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    }
+    HostStaging(const HostStaging&) = delete;
+    HostStaging& operator=(const HostStaging&) = delete;
+
+    Context context;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* mapped = nullptr;
+};
 
 class DepthSurface {
 public:
@@ -1313,6 +1345,46 @@ private:
         recorder->EndGpuTiming(timing, moved);
     }
 
+public:
+    std::uint32_t depthTexelBytes() const {
+        return hostFormat == VK_FORMAT_D16_UNORM || hostFormat == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u;
+    }
+
+    // Reads the whole depth plane with a batch of its own; the caller has the GPU idle.
+    std::vector<std::byte> ReadDepthPlane() {
+        const auto bytes = static_cast<std::size_t>(target.extent.width) * target.extent.height * depthTexelBytes();
+        auto staging = std::make_shared<HostStaging>(context, bytes);
+        CommandBatch batch(context);
+        const VkBufferImageCopy region{0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(batch.Handle(), image, VK_IMAGE_LAYOUT_GENERAL, staging->buffer, 1, &region);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        std::vector<std::byte> result(bytes);
+        std::memcpy(result.data(), staging->mapped, bytes);
+        return result;
+    }
+
+    // Fills the whole depth plane, ordered after the surface's own creation commands.
+    void WriteDepthPlane(std::span<const std::byte> bytes) {
+        Require(bytes.size() == static_cast<std::size_t>(target.extent.width) * target.extent.height * depthTexelBytes(), "saved depth plane has the wrong size");
+        auto staging = std::make_shared<HostStaging>(context, bytes.size());
+        std::memcpy(staging->mapped, bytes.data(), bytes.size());
+        auto* recorder = RecorderFor(context);
+        std::unique_ptr<CommandBatch> batch;
+        if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
+        const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        if (recorder != nullptr) recorder->Keep(staging, bytes.size());
+        const VkBufferImageCopy region{0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, staging->buffer, image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        if (batch) batch->SubmitAndWait();
+        pendingClear &= ~static_cast<VkImageAspectFlags>(VK_IMAGE_ASPECT_DEPTH_BIT);
+        written = ++depthWrites;
+    }
+
+private:
     void release() noexcept {
         depthPlane = {};
         stencilPlane = {};
@@ -2283,6 +2355,10 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
     return constant * 256.0f;
 }
 
+namespace {
+std::optional<SavedDepthSurface> takeSavedDepth(const DepthTarget& target);
+}
+
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten) {
     const auto planeBytes = [&](std::uint32_t bytesPerTexel) { return target.samples == 1u ? DepthSliceBytes(target.extent, bytesPerTexel) : MultisampledDepthBytes_nid_no_patch(target.extent, bytesPerTexel, target.samples); };
     ClaimMultisampleTargetMemory(target.address, planeBytes(target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u));
@@ -2341,6 +2417,14 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         if (!created) surface->NoteHtileClear(VK_IMAGE_ASPECT_DEPTH_BIT);
     }
     if (!created) surface->NoteHtileClear(htileCleared);
+    // A replay creates a GPU-only plane the capture saved when the frames first draw into it, so it starts from
+    // the saved texels, as the title's surface did, instead of from a fresh clear.
+    if (created) {
+        if (auto saved = takeSavedDepth(target)) {
+            surface->WriteDepthPlane(saved->depth);
+            std::fprintf(stderr, "[depth-restore] 0x%llx %ux%u format %d restored at creation\n", static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, static_cast<int>(target.format));
+        }
+    }
     if (mirrorable(target)) surface->SyncFromMemory(mirrorResource(target));
     if (surface->StencilMirrorable()) surface->SyncStencilFromMemory(stencilResource(target));
     surface->ApplyFastClear();
@@ -2762,11 +2846,106 @@ thread_local bool depthCopySourceActive = false;
 
 }
 
+namespace {
+
+std::mutex& savedDepthMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::map<std::uint64_t, SavedDepthSurface>& savedDepth() {
+    static std::map<std::uint64_t, SavedDepthSurface> saved;
+    return saved;
+}
+
+std::optional<SavedDepthSurface> takeSavedDepth(const DepthTarget& target) {
+    std::lock_guard lock(savedDepthMutex());
+    const auto found = savedDepth().find(target.address);
+    if (found == savedDepth().end()) return std::nullopt;
+    const auto& saved = found->second.target;
+    if (saved.extent.width != target.extent.width || saved.extent.height != target.extent.height || saved.format != target.format || saved.samples != target.samples) return std::nullopt;
+    auto result = std::move(found->second);
+    savedDepth().erase(found);
+    return result;
+}
+
+bool savedDepthWaiting(std::uint64_t address) {
+    std::lock_guard lock(savedDepthMutex());
+    return savedDepth().contains(address);
+}
+
+// Creates the surface a saved plane belonged to and fills it, once; true when it did.
+bool restoreSavedDepth(const Context& context, std::uint64_t address) {
+    SavedDepthSurface saved;
+    {
+        std::lock_guard lock(savedDepthMutex());
+        const auto found = savedDepth().find(address);
+        if (found == savedDepth().end()) return false;
+        saved = std::move(found->second);
+        savedDepth().erase(found);
+    }
+    Require(HostDepthFormat(context, saved.target.format) == saved.hostFormat, "saved depth plane has another host format than this device");
+    static_cast<void>(DepthSurfaceView(context, saved.target, true));
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    std::lock_guard lock(surfacesMutex());
+    auto* surface = planeSurface(context.device, address);
+    Require(surface != nullptr, "restored depth surface is missing");
+    surface->WriteDepthPlane(saved.depth);
+    std::fprintf(stderr, "[depth-restore] 0x%llx %ux%u format %d restored\n", static_cast<unsigned long long>(address), saved.target.extent.width, saved.target.extent.height, static_cast<int>(saved.target.format));
+    return true;
+}
+
+}
+
+std::vector<SavedDepthSurface> ReadBackDepthSurfaces() {
+    std::vector<SavedDepthSurface> result;
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (!surface->active->load(std::memory_order_acquire) || surface->retired || surface->target.samples != 1u || mirrorable(surface->target)) continue;
+        if ((surface->pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) continue;
+        SavedDepthSurface saved;
+        saved.target = surface->target;
+        saved.hostFormat = surface->hostFormat;
+        saved.depth = surface->ReadDepthPlane();
+        result.push_back(std::move(saved));
+    }
+    return result;
+}
+
+void SetSavedDepthSurfaces(std::vector<SavedDepthSurface> saved) {
+    std::lock_guard lock(savedDepthMutex());
+    savedDepth().clear();
+    for (auto& entry : saved) {
+        const auto address = entry.target.address;
+        std::fprintf(stderr, "[depth-saved] 0x%llx %ux%u format %d stencil 0x%llx htile 0x%llx slices %u..%u\n", static_cast<unsigned long long>(address), entry.target.extent.width, entry.target.extent.height, static_cast<int>(entry.target.format), static_cast<unsigned long long>(entry.target.stencilAddress), static_cast<unsigned long long>(entry.target.htileAddress), entry.target.firstSlice, entry.target.lastSlice);
+        savedDepth()[address] = std::move(entry);
+    }
+}
+
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType multisampleViewType) {
     const auto held = [&](const auto& surface) {
         return surface->active->load(std::memory_order_acquire) && surface->context.device == context.device && !surface->retired && (surface->target.address == resource.baseAddress || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == resource.baseAddress));
     };
     {
+        std::lock_guard lock(surfacesMutex());
+        const bool any = std::any_of(surfaces().begin(), surfaces().end(), held);
+        // Lab diagnostic: each depth-like texture address once, with whether a live depth surface backs it.
+        static const bool logReads = std::getenv("APS5_LOG_DEPTH_READS") != nullptr;
+        if (logReads) {
+            const auto format = ResolveTextureFormat(resource.format);
+            if (format == VK_FORMAT_R16_UNORM || format == VK_FORMAT_R32_SFLOAT) {
+                static std::mutex logMutex;
+                static std::set<std::pair<std::uint64_t, bool>> logged;
+                std::lock_guard logLock(logMutex);
+                if (logged.size() < 4096 && logged.emplace(resource.baseAddress, any).second) {
+                    std::fprintf(stderr, "[depth-read] 0x%llx %ux%u fmt=%d surface=%d\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<int>(format), any ? 1 : 0);
+                }
+            }
+        }
+        if (!any && !savedDepthWaiting(resource.baseAddress)) return nullptr;
+    }
+    if (!restoreSavedDepth(context, resource.baseAddress)) {
         std::lock_guard lock(surfacesMutex());
         if (std::none_of(surfaces().begin(), surfaces().end(), held)) return nullptr;
     }
@@ -3071,4 +3250,32 @@ void SetDirectDepthCopy(bool enabled) {
     directDepthCopy.store(enabled && std::getenv("APS5_NO_DIRECT_DEPTH_COPY") == nullptr, std::memory_order_relaxed);
 }
 
+}
+
+extern "C" std::size_t AgcDriverLoadSavedDepth_nid_postfix(const char* path) {
+    using AgcDriver::Graphics::DepthTarget;
+    using AgcDriver::Graphics::SavedDepthSurface;
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return 0;
+    std::uint32_t magic = 0;
+    std::uint32_t targetBytes = 0;
+    std::uint32_t count = 0;
+    file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    file.read(reinterpret_cast<char*>(&targetBytes), sizeof(targetBytes));
+    file.read(reinterpret_cast<char*>(&count), sizeof(count));
+    if (!file || magic != 0x48545044 || targetBytes != sizeof(DepthTarget)) throw std::runtime_error("frame replay: depth.bin is not from this build");
+    std::vector<SavedDepthSurface> saved(count);
+    for (auto& plane : saved) {
+        std::int32_t format = 0;
+        std::uint64_t bytes = 0;
+        file.read(reinterpret_cast<char*>(&plane.target), sizeof(plane.target));
+        file.read(reinterpret_cast<char*>(&format), sizeof(format));
+        file.read(reinterpret_cast<char*>(&bytes), sizeof(bytes));
+        plane.hostFormat = static_cast<VkFormat>(format);
+        plane.depth.resize(static_cast<std::size_t>(bytes));
+        file.read(reinterpret_cast<char*>(plane.depth.data()), static_cast<std::streamsize>(bytes));
+        if (!file) throw std::runtime_error("frame replay: depth.bin is truncated");
+    }
+    AgcDriver::Graphics::SetSavedDepthSurfaces(std::move(saved));
+    return count;
 }

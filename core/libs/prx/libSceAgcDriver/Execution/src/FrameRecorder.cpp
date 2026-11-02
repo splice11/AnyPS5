@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/TraceRevision.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -127,6 +128,19 @@ std::uint64_t fileBackedEnd(const HostMapping::Mapping& mapping) {
     return mapping.start + unreadable * page;
 }
 #endif
+
+// Copies a host heap page the title may free at any time: false instead of a fault when it is gone.
+bool copyHostPage(std::uint64_t address, std::span<std::byte> bytes) {
+#ifdef __linux__
+    iovec local{bytes.data(), bytes.size()};
+    iovec remote{reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)), bytes.size()};
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(bytes.size());
+#else
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), bytes.size())) return false;
+    std::memcpy(bytes.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), bytes.size());
+    return true;
+#endif
+}
 
 std::uint64_t contentHash(std::span<const std::byte> bytes) {
     std::uint64_t hash = 0xcbf29ce484222325ull;
@@ -285,11 +299,15 @@ void FrameRecorder::record(FrameCall call, bool prologueCall, std::span<const Sh
 void FrameRecorder::recordLocked(FrameCall call, bool prologueCall, std::span<const Shader* const> shaders) {
     if (state == State::Waiting) {
         if (!prologueCall) return;
+        for (const auto* shader : shaders) {
+            if (shader != nullptr) prologueShaders.insert(shader);
+        }
         call.ordinal = ++ordinal;
         prologue.push_back(std::move(call));
         return;
     }
     if (state != State::Recording) return;
+    pendingKind = call.kind;
     if (prologueCall) emitShaderDelta(shaders);
     else emitDelta();
     if (state != State::Recording) return;
@@ -361,9 +379,7 @@ std::vector<FrameRecorder::Range> FrameRecorder::newRanges() {
     return added;
 }
 
-void FrameRecorder::emitShaderDelta(std::span<const Shader* const> shaders) {
-    std::set<std::uint64_t> blocks;
-    std::set<std::uint64_t> hostPages;
+void FrameRecorder::collectShaderPages(std::span<const Shader* const> shaders, std::set<std::uint64_t>& blocks, std::set<std::uint64_t>& hostPages) {
     std::uintptr_t arenaBase = 0;
     std::size_t arenaBytes = 0;
     GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
@@ -391,7 +407,41 @@ void FrameRecorder::emitShaderDelta(std::span<const Shader* const> shaders) {
         note(shader->user_data->direct_resource_offset);
         for (const auto* sharps : shader->user_data->sharp_resource_offset) note(sharps);
     }
+}
+
+// Shader data a title keeps outside its registered allocations (host heap pages) is in no range, so a replay
+// could neither map nor fill it. Each such page becomes a host range of its own.
+std::vector<FrameRecorder::Range> FrameRecorder::uncoveredHostPages(const std::set<std::uint64_t>& hostPages) const {
+    std::vector<Range> added;
+    for (const auto page : hostPages) {
+        const bool covered = std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.address <= page && page + HostPageBytes <= range.address + range.bytes; });
+        if (covered) continue;
+        if (!added.empty() && added.back().address + added.back().bytes == page) {
+            added.back().bytes += HostPageBytes;
+            continue;
+        }
+        Range range;
+        range.address = page;
+        range.bytes = HostPageBytes;
+        range.kind = FrameRangeKind::Host;
+        range.protection = 0x04; // PAGE_READWRITE, as windowsProtection reports a read-write mapping
+        range.access = FrameRangeAccess::Readable | FrameRangeAccess::Writable;
+        range.readable = true;
+        added.push_back(range);
+    }
+    return added;
+}
+
+void FrameRecorder::emitShaderDelta(std::span<const Shader* const> shaders) {
+    std::set<std::uint64_t> blocks;
+    std::set<std::uint64_t> hostPages;
+    collectShaderPages(shaders, blocks, hostPages);
     if (blocks.empty() && hostPages.empty()) return;
+    for (const auto& range : uncoveredHostPages(hostPages)) {
+        writer->WriteRange(range.address, range.bytes, range.kind, range.protection, range.access);
+        ranges.push_back(range);
+        ++lateRanges;
+    }
     const auto mark = GuestMemory::WriteGeneration();
     std::vector<Span> spans;
     for (const auto block : blocks) {
@@ -414,7 +464,23 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
     auto& driver = DriverDetail::Driver::Get();
     auto [accepted, completed] = driver.SerialProgress();
     if (completed < accepted && (!added.empty() || !blocks.empty())) {
-        if (!driver.WaitIdleFor(std::chrono::seconds(10))) {
+        // A title whose queued work waits on a label that only a later call releases never goes idle here.
+        // With APS5_FRAME_CAPTURE_DELTA_WAIT_MS set, the delta is read without that wait and counted instead.
+        static const auto unsyncedWaitMs = readNumber(std::getenv("APS5_FRAME_CAPTURE_DELTA_WAIT_MS"), 0);
+        if (unsyncedWaitMs != 0) {
+            if (!driver.WaitIdleFor(std::chrono::milliseconds(unsyncedWaitMs))) {
+                ++unsyncedDeltas;
+                std::uint64_t bytes = 0;
+                for (const auto& [begin, end] : blocks) bytes += end - begin;
+                std::fprintf(stderr, "[frame-capture] unsynced delta before %s: serials %llu/%llu, %zu blocks (%.1f MiB), %zu host pages, %zu new ranges\n",
+                             std::string(FrameCallName(pendingKind)).c_str(), static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted),
+                             blocks.size(), static_cast<double>(bytes) / (1024.0 * 1024.0), hostPages.size(), added.size());
+                for (std::size_t index = 0; index < blocks.size() && index < 12; ++index) {
+                    std::fprintf(stderr, "[frame-capture]   block 0x%llx+0x%llx\n", static_cast<unsigned long long>(blocks[index].first), static_cast<unsigned long long>(blocks[index].second - blocks[index].first));
+                }
+                if (std::getenv("APS5_FRAME_CAPTURE_DROP_UNSYNCED") != nullptr) return;
+            }
+        } else if (!driver.WaitIdleFor(std::chrono::seconds(10))) {
             stop("stopped: the GPU work submitted before a memory delta did not finish within 10 s");
             return;
         }
@@ -444,9 +510,8 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
         }
     }
     for (const auto page : hostPages) {
-        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(page)), HostPageBytes)) continue;
         bytes.resize(HostPageBytes);
-        std::memcpy(bytes.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(page)), HostPageBytes);
+        if (!copyHostPage(page, bytes)) continue;
         const auto hash = contentHash(bytes);
         auto& known = hostPageHashes[page];
         if (known == hash) continue;
@@ -528,6 +593,24 @@ void FrameRecorder::start() {
     startBoundary = boundaries;
     allocationsGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     ranges = committedRanges();
+    {
+        std::set<std::uint64_t> blocks;
+        std::set<std::uint64_t> hostPages;
+        const std::vector<const Shader*> shaders(prologueShaders.begin(), prologueShaders.end());
+        collectShaderPages(shaders, blocks, hostPages);
+        // Copied before the long snapshot of the other ranges, which the title's heap does not wait for.
+        for (auto range : uncoveredHostPages(hostPages)) {
+            for (std::uint64_t at = 0; at < range.bytes; at += HostPageBytes) {
+                std::vector<std::byte> bytes(HostPageBytes);
+                if (!copyHostPage(range.address + at, bytes)) continue;
+                Range page = range;
+                page.address = range.address + at;
+                page.bytes = HostPageBytes;
+                prologuePages.emplace_back(page, std::move(bytes));
+            }
+        }
+        prologueHostRanges = prologuePages.size();
+    }
     writer = std::make_unique<FrameCaptureWriter>(directory);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
     for (const auto& range : ranges) {
@@ -538,6 +621,13 @@ void FrameRecorder::start() {
         snapshot(range);
         if (!writer) return;
     }
+    for (const auto& [range, bytes] : prologuePages) {
+        writer->WriteRange(range.address, range.bytes, range.kind, range.protection, range.access);
+        snapshotBytes += writer->WriteSnapshot(range.address, bytes);
+        ranges.push_back(range);
+    }
+    prologuePages.clear();
+    writeSavedDepth();
     for (const auto& call : prologue) writer->WriteCall(call);
     std::uintptr_t ringBase = 0;
     std::uint32_t ringSize = 0;
@@ -561,6 +651,30 @@ void FrameRecorder::start() {
     recordedFrames = 0;
     std::fprintf(stderr, "[frame-capture] started at frame boundary %llu: %zu ranges, %.1f MiB snapshot in %.1f s\n", static_cast<unsigned long long>(boundaries), ranges.size(),
                  static_cast<double>(snapshotBytes) / (1024.0 * 1024.0), std::chrono::duration<double>(std::chrono::steady_clock::now() - startedAt).count());
+}
+
+// depth.bin: per plane, the DepthTarget bytes, the host format, the plane size and the packed texels.
+void FrameRecorder::writeSavedDepth() {
+    const auto saved = Graphics::ReadBackDepthSurfaces();
+    std::ofstream file(directory / "depth.bin", std::ios::binary | std::ios::trunc);
+    const std::uint32_t magic = 0x48545044; // "DPTH"
+    const auto count = static_cast<std::uint32_t>(saved.size());
+    const auto targetBytes = static_cast<std::uint32_t>(sizeof(Graphics::DepthTarget));
+    file.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+    file.write(reinterpret_cast<const char*>(&targetBytes), sizeof(targetBytes));
+    file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    std::uint64_t total = 0;
+    for (const auto& plane : saved) {
+        file.write(reinterpret_cast<const char*>(&plane.target), sizeof(plane.target));
+        const auto format = static_cast<std::int32_t>(plane.hostFormat);
+        const auto bytes = static_cast<std::uint64_t>(plane.depth.size());
+        file.write(reinterpret_cast<const char*>(&format), sizeof(format));
+        file.write(reinterpret_cast<const char*>(&bytes), sizeof(bytes));
+        file.write(reinterpret_cast<const char*>(plane.depth.data()), static_cast<std::streamsize>(bytes));
+        total += bytes;
+    }
+    savedDepthPlanes = saved.size();
+    std::fprintf(stderr, "[frame-capture] saved %zu GPU-only depth planes (%.1f MiB)\n", saved.size(), static_cast<double>(total) / (1024.0 * 1024.0));
 }
 
 void FrameRecorder::finish() {
@@ -591,6 +705,9 @@ std::string FrameRecorder::header() const {
     text += ",\"calls\":" + std::to_string(recordedCalls) + ",\"prologue_calls\":" + std::to_string(prologue.size());
     text += ",\"ranges\":" + std::to_string(ranges.size()) + ",\"late_ranges\":" + std::to_string(lateRanges) + ",\"snapshot_bytes\":" + std::to_string(snapshotBytes) + ",\"unreadable_bytes\":" + std::to_string(unreadableBytes) + ",\"host_only_sample_bytes\":" + std::to_string(hostOnlySampleBytes);
     text += ",\"memory_groups\":" + std::to_string(deltaGroups) + ",\"delta_bytes\":" + std::to_string(deltaBytes);
+    text += ",\"unsynced_deltas\":" + std::to_string(unsyncedDeltas);
+    text += ",\"prologue_host_ranges\":" + std::to_string(prologueHostRanges);
+    text += ",\"saved_depth_planes\":" + std::to_string(savedDepthPlanes);
     text += ",\"capture_seconds\":" + std::to_string(std::chrono::duration<double>(std::chrono::steady_clock::now() - startedAt).count());
     text += ",\"env\":{";
     bool first = true;
